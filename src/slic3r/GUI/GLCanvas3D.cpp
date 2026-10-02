@@ -1755,7 +1755,8 @@ void GLCanvas3D::toggle_model_objects_visibility(bool visible, const ModelObject
                     if (  (gizmo_type == GLGizmosManager::FdmSupports
                         || gizmo_type == GLGizmosManager::Seam
                         || gizmo_type == GLGizmosManager::Cut
-                        || gizmo_type == GLGizmosManager::FuzzySkin)
+                        || gizmo_type == GLGizmosManager::FuzzySkin
+                        || gizmo_type == GLGizmosManager::Strength)
                         && !vol->is_modifier) {
                         vol->force_neutral_color = true;
                     }
@@ -4566,7 +4567,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                     && m_gizmos.get_current_type() != GLGizmosManager::Seam
                     && m_gizmos.get_current_type() != GLGizmosManager::Cut
                     && m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation
-                    && m_gizmos.get_current_type() != GLGizmosManager::FuzzySkin) {
+                    && m_gizmos.get_current_type() != GLGizmosManager::FuzzySkin
+                    && m_gizmos.get_current_type() != GLGizmosManager::Strength) {
                     m_rectangle_selection.start_dragging(m_mouse.position, evt.ShiftDown() ? GLSelectionRectangle::Select : GLSelectionRectangle::Deselect);
 
                     if (!has_mouse_capture())  // ORCA keep tracking mouse position while drag active and cursor not in window bounds
@@ -4751,7 +4753,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                 const Vec3d rot = (Vec3d(pos.x(), pos.y(), 0.) - m_mouse.drag.start_position_3D) * (PI * TRACKBALLSIZE / 180.) * mult;
                 if (this->m_canvas_type == ECanvasType::CanvasAssembleView || m_gizmos.get_current_type() == GLGizmosManager::FdmSupports ||
                     m_gizmos.get_current_type() == GLGizmosManager::Seam || m_gizmos.get_current_type() == GLGizmosManager::MmSegmentation ||
-                    m_gizmos.get_current_type() == GLGizmosManager::FuzzySkin) {
+                    m_gizmos.get_current_type() == GLGizmosManager::FuzzySkin || m_gizmos.get_current_type() == GLGizmosManager::Strength) {
                     // Orca: Reuse the centralized pivot policy for scene-oriented tools.
                     const std::optional<Vec3d> rotate_target = get_camera_orbit_target(ECameraNavigationType::Mouse);
                     if (rotate_target.has_value())
@@ -11079,7 +11081,8 @@ std::optional<Vec3d> GLCanvas3D::get_camera_orbit_target(ECameraNavigationType n
     const GLGizmosManager::EType gizmo_type = m_gizmos.get_current_type();
     const bool use_scene_target = m_canvas_type == ECanvasType::CanvasAssembleView ||
         gizmo_type == GLGizmosManager::FdmSupports || gizmo_type == GLGizmosManager::Seam ||
-        gizmo_type == GLGizmosManager::MmSegmentation || gizmo_type == GLGizmosManager::FuzzySkin;
+        gizmo_type == GLGizmosManager::MmSegmentation || gizmo_type == GLGizmosManager::FuzzySkin ||
+        gizmo_type == GLGizmosManager::Strength;
     if (use_scene_target) {
         if (!m_selection.is_empty())
             return m_selection.get_bounding_box().center();
@@ -11122,7 +11125,7 @@ bool GLCanvas3D::is_bed_visible() const
 
     const auto type = m_gizmos.get_current_type();
     return type != GLGizmosManager::FdmSupports && type != GLGizmosManager::Seam &&
-        type != GLGizmosManager::MmSegmentation && type != GLGizmosManager::FuzzySkin;
+        type != GLGizmosManager::MmSegmentation && type != GLGizmosManager::FuzzySkin && type != GLGizmosManager::Strength;
 }
 
 Vec3d GLCanvas3D::get_camera_pan_anchor(Camera& camera, ECameraNavigationType navigation_type,

@@ -18,6 +18,7 @@
 #include "slic3r/GUI/Gizmos/GLGizmoFdmSupports.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoFuzzySkin.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoBrimEars.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoStrength.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoCut.hpp"
 //#include "slic3r/GUI/Gizmos/GLGizmoFaceDetector.hpp"
 //#include "slic3r/GUI/Gizmos/GLGizmoHollow.hpp"
@@ -212,6 +213,9 @@ void GLGizmosManager::switch_gizmos_icon_filename()
         case (EType::BrimEars):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg");
             break;
+        case (EType::Strength):
+            gizmo->set_icon_filename(m_is_dark ? "toolbar_strength_dark.svg" : "toolbar_strength.svg");
+            break;
 #ifdef SLIC3R_CAD
         case (EType::Primitive):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_modifier_cube_dark.svg" : "toolbar_modifier_cube.svg");
@@ -265,6 +269,7 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoAssembly(m_parent, m_is_dark ? "toolbar_assembly_dark.svg" : "toolbar_assembly.svg", EType::Assembly));
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, "reduce_triangles.svg", EType::Simplify));
     m_gizmos.emplace_back(new GLGizmoBrimEars(m_parent, m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg", EType::BrimEars));
+    m_gizmos.emplace_back(new GLGizmoStrength(m_parent, m_is_dark ? "toolbar_strength_dark.svg" : "toolbar_strength.svg", EType::Strength));
 #ifdef SLIC3R_CAD
     // Registered last: Primitive and Sketch are the final entries before Undefined, so
     // omitting them leaves every preceding m_gizmos index (indexed by EType) untouched.
@@ -599,6 +604,8 @@ bool GLGizmosManager::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_p
         return dynamic_cast<GLGizmoMeshBoolean*>(m_gizmos[MeshBoolean].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else if (m_current == BrimEars)
         return dynamic_cast<GLGizmoBrimEars*>(m_gizmos[BrimEars].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
+    else if (m_current == Strength)
+        return dynamic_cast<GLGizmoStrength*>(m_gizmos[Strength].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else
         return false;
 }
@@ -609,6 +616,7 @@ bool GLGizmosManager::is_paint_gizmo()
            m_current == EType::MmSegmentation ||
            m_current == EType::FuzzySkin ||
            m_current == EType::TextureDisplacement ||
+           m_current == EType::Strength ||
            m_current == EType::Seam;
 }
 
@@ -710,7 +718,7 @@ bool GLGizmosManager::on_mouse_wheel(const wxMouseEvent &evt)
 {
     bool processed = false;
 
-    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam || m_current == MmSegmentation || m_current == FuzzySkin || m_current == BrimEars) {
+    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam || m_current == MmSegmentation || m_current == FuzzySkin || m_current == BrimEars || m_current == Strength) {
         float rot = (float)evt.GetWheelRotation() / (float)evt.GetWheelDelta();
         if (gizmo_event((rot > 0.f ? SLAGizmoEventType::MouseWheelUp : SLAGizmoEventType::MouseWheelDown), Vec2d::Zero(), evt.ShiftDown(), evt.AltDown()
             // BBS
@@ -1474,7 +1482,7 @@ bool GLGizmosManager::activate_gizmo(EType type)
     GLGizmoBase& new_gizmo = *m_gizmos[type];
     if (!new_gizmo.is_activable()) return false;
 
-    if (type == Seam || type == FdmSupports || type == FuzzySkin) {
+    if (type == Seam || type == FdmSupports || type == FuzzySkin || type == Strength) {
         if (wxGetApp().app_config != nullptr && wxGetApp().app_config->get_bool(SETTING_OPENGL_REALISTIC_MODE)) {
             m_restore_realistic_view_after_paint = true;
             wxGetApp().app_config->set_bool(SETTING_OPENGL_REALISTIC_MODE, false);
@@ -1561,6 +1569,8 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
         return "Fuzzy Skin Painting";
     case GLGizmosManager::EType::TextureDisplacement:
         return "Texture Displacement";
+    case GLGizmosManager::EType::Strength:
+        return "Strength Check";
     default:
         return "";
     }

@@ -136,6 +136,8 @@ set(lisbslic3r_sources
     FaceDetector.hpp
     Feature/FuzzySkin/FuzzySkin.cpp
     Feature/FuzzySkin/FuzzySkin.hpp
+    Feature/StrengthAnalysis/StrengthAnalysis.cpp
+    Feature/StrengthAnalysis/StrengthAnalysis.hpp
     Feature/Interlocking/InterlockingGenerator.cpp
     Feature/Interlocking/InterlockingGenerator.hpp
     Feature/Interlocking/VoxelUtils.cpp

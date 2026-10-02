@@ -38,7 +38,8 @@ enum class PainterGizmoType {
     SEAM,
     MM_SEGMENTATION,
     FUZZY_SKIN,
-    TEXTURE_DISPLACEMENT
+    TEXTURE_DISPLACEMENT,
+    STRENGTH
 };
 
 class TriangleSelectorGUI : public TriangleSelector {
@@ -325,14 +326,15 @@ protected:
 
     TriangleSelector::ClippingPlane get_clipping_plane_in_volume_coordinates(const Transform3d &trafo) const;
 
+    // World transforms of the model parts, in mo->volumes order.
+    std::vector<Transform3d> mesh_trafo_matrices() const;
+
 private:
     std::vector<std::vector<ProjectedMousePosition>> get_projected_mouse_positions(const Vec2d &mouse_position, double resolution, const std::vector<Transform3d> &trafo_matrices) const;
 
     std::vector<ProjectedHeightRange> get_projected_height_range(const Vec2d& mouse_position, double resolution, const std::vector<const ModelVolume*>& part_volumes, const std::vector<Transform3d>& trafo_matrices) const;
 
     bool is_mesh_point_clipped(const Vec3d& point, const Transform3d& trafo) const;
-    // World transforms of the model parts, in mo->volumes order.
-    std::vector<Transform3d> mesh_trafo_matrices() const;
     void update_raycast_cache(const Vec2d& mouse_position,
                               const Camera& camera,
                               const std::vector<Transform3d>& trafo_matrices) const;
