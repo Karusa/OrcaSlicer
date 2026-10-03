@@ -2,6 +2,7 @@
 
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Print.hpp"
 #include "libslic3r/PresetBundle.hpp"
 
 #include "slic3r/GUI/Camera.hpp"
@@ -31,9 +32,22 @@ constexpr double LB_TO_N = 4.4482216152605;
 // Snap the aimed arrow onto an axis when it comes this close to one.
 constexpr double AXIS_SNAP_DEG = 4.;
 constexpr double ARROW_GRAB_PX = 10.;
+// An exaggerated deflection is drawn this large relative to the part.
+constexpr double EXAGGERATED_DEFLECTION = 0.1;
+constexpr double ANIMATION_PERIOD_S     = 2.;
+constexpr double FLASH_HZ               = 1.5;
 
 const ColorRGBA AxisColors[3] = {{0.9f, 0.2f, 0.2f, 0.6f}, {0.2f, 0.75f, 0.2f, 0.6f}, {0.25f, 0.45f, 1.f, 0.6f}};
 const ColorRGBA CriticalColor = {0.9f, 0.1f, 0.1f, 1.f};
+// Utilization from 0 (blue) to the breaking point and beyond (red).
+const std::array<ColorRGBA, 8> StressColors{{{0.15f, 0.3f, 0.9f, 1.f},
+                                             {0.1f, 0.55f, 0.95f, 1.f},
+                                             {0.1f, 0.75f, 0.8f, 1.f},
+                                             {0.2f, 0.75f, 0.35f, 1.f},
+                                             {0.65f, 0.8f, 0.2f, 1.f},
+                                             {0.95f, 0.8f, 0.15f, 1.f},
+                                             {0.95f, 0.5f, 0.1f, 1.f},
+                                             {0.9f, 0.12f, 0.1f, 1.f}}};
 
 double distance_to_segment(const Vec2d &p, const Vec2d &a, const Vec2d &b)
 {
@@ -94,19 +108,20 @@ wxString GLGizmoStrength::handle_snapshot_action_name(bool shift_down, Button bu
 
 void GLGizmoStrength::on_save(cereal::BinaryOutputArchive &ar) const
 {
-    ar(m_paint, m_direction.x(), m_direction.y(), m_direction.z(), m_magnitude, m_unit);
+    ar(m_paint, m_direction.x(), m_direction.y(), m_direction.z(), m_magnitude, m_unit, m_load_mode, m_target_fos);
 }
 
 void GLGizmoStrength::on_load(cereal::BinaryInputArchive &ar)
 {
-    ar(m_paint, m_direction.x(), m_direction.y(), m_direction.z(), m_magnitude, m_unit);
+    ar(m_paint, m_direction.x(), m_direction.y(), m_direction.z(), m_magnitude, m_unit, m_load_mode, m_target_fos);
     invalidate_result();
+    update_result();
     GLGizmoPainterBase::on_load(ar);
 }
 
 void GLGizmoStrength::update_model_object()
 {
-    const ModelObject *mo = m_c->selection_info()->model_object();
+    const ModelObject *mo    = m_c->selection_info()->model_object();
     Paint             &paint = m_paint[mo->id().id];
     paint.clear();
     size_t idx = 0;
@@ -138,8 +153,10 @@ void GLGizmoStrength::update_from_model_object(bool first_update)
         ++idx;
     }
 
-    if (first_update)
-        m_result.reset();
+    if (first_update) {
+        m_base_result.reset();
+        update_result();
+    }
     update_load_point();
 }
 
@@ -163,10 +180,12 @@ void GLGizmoStrength::update_load_point()
     m_arrow_length = std::clamp(0.35 * bbox.max_size(), 10., 60.);
 }
 
-Vec3d GLGizmoStrength::force() const
+double GLGizmoStrength::unit_to_newton() const { return m_unit == Unit::Kilogram ? KG_TO_N : m_unit == Unit::Pound ? LB_TO_N : 1.; }
+
+std::string GLGizmoStrength::format_load(double newtons) const
 {
-    const double scale = m_unit == Unit::Kilogram ? KG_TO_N : m_unit == Unit::Pound ? LB_TO_N : 1.;
-    return m_direction * double(m_magnitude) * scale;
+    const char *units[3] = {"kg", "lb", "N"};
+    return (boost::format("%1$.2f %2%") % (newtons / unit_to_newton()) % units[int(m_unit)]).str();
 }
 
 void GLGizmoStrength::set_direction(const Vec3d &direction)
@@ -256,18 +275,81 @@ void GLGizmoStrength::render_model(GLModel &model, const Transform3d &matrix, co
     shader->stop_using();
 }
 
+bool GLGizmoStrength::failed() const
+{
+    return m_result && m_result->ok() && !m_result_stale && m_load_mode == LoadMode::CheckLoad && m_result->safety_factor < 1.;
+}
+
+bool GLGizmoStrength::show_result_mesh() const
+{
+    return m_result && m_result->ok() && !m_result_stale && (m_show_stress || m_show_deflection) && !m_result_mesh.indices.empty();
+}
+
+// Rebuilds the result view: triangles bucketed into stress bands, displaced by
+// `phase` (0..1) of the drawn deflection.
+void GLGizmoStrength::update_result_mesh(double phase)
+{
+    double scale = 0.;
+    if (m_show_deflection) {
+        double max_d = 0.;
+        for (const Vec3d &d : m_vertex_displacement)
+            max_d = std::max(max_d, d.norm());
+        max_d *= m_result_load;
+        const double size = Slic3r::bounding_box(m_result_mesh).max_size();
+        scale = phase * m_result_load * (m_exaggerate && max_d > 0. ? std::max(1., EXAGGERATED_DEFLECTION * size / max_d) : 1.);
+    }
+
+    std::array<GLModel::Geometry, StressBands> bands;
+    for (GLModel::Geometry &g : bands)
+        g.format = {GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3N3};
+    for (const Vec3i32 &f : m_result_mesh.indices) {
+        std::array<Vec3f, 3> p;
+        double               util = 0.;
+        for (int k = 0; k < 3; ++k) {
+            p[k] = m_result_mesh.vertices[f[k]] + (scale * m_vertex_displacement[f[k]]).cast<float>();
+            util += m_vertex_utilization[f[k]] * m_result_load / 3.;
+        }
+        const size_t band = m_show_stress ? size_t(std::clamp(int(util * (StressBands - 1) + 0.5), 0, int(StressBands) - 1)) : 0;
+        GLModel::Geometry &g = bands[band];
+        const Vec3f        n = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
+        const unsigned int i = unsigned(g.vertices_count());
+        for (const Vec3f &v : p)
+            g.add_vertex(v, n);
+        g.add_triangle(i, i + 1, i + 2);
+    }
+    for (size_t b = 0; b < StressBands; ++b) {
+        m_stress_models[b].reset();
+        if (!bands[b].is_empty())
+            m_stress_models[b].init_from(std::move(bands[b]));
+    }
+    m_mesh_phase = phase;
+}
+
 void GLGizmoStrength::render_painter_gizmo()
 {
     const Selection &selection = m_parent.get_selection();
+    const double     t = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start_time).count();
 
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glEnable(GL_DEPTH_TEST));
 
-    render_triangles(selection);
-    m_c->object_clipper()->render_cut();
-    m_c->instances_hider()->render_cut();
-    if (!m_arrow_hovered && !m_aiming)
-        render_cursor();
+    if (show_result_mesh()) {
+        const bool   moving = m_show_deflection && m_animate;
+        const double phase  = !m_show_deflection ? 0. : moving ? 0.5 - 0.5 * std::cos(2. * PI * t / ANIMATION_PERIOD_S) : 1.;
+        if (m_mesh_phase < 0. || std::abs(phase - m_mesh_phase) > 0.004)
+            update_result_mesh(phase);
+        for (size_t b = 0; b < StressBands; ++b)
+            if (m_stress_models[b].is_initialized())
+                render_model(m_stress_models[b], Transform3d::Identity(), m_show_stress ? StressColors[b] : GLVolume::NEUTRAL_COLOR);
+        if (moving)
+            m_parent.request_extra_frame();
+    } else {
+        render_triangles(selection);
+        m_c->object_clipper()->render_cut();
+        m_c->instances_hider()->render_cut();
+        if (!m_arrow_hovered && !m_aiming)
+            render_cursor();
+    }
 
     if (m_load_point) {
         const bool active = m_arrow_hovered || m_aiming;
@@ -280,11 +362,39 @@ void GLGizmoStrength::render_painter_gizmo()
             render_model(m_ring, at * Geometry::rotation_transform({0.5 * PI, 0., 0.}), AxisColors[1]);
         }
     }
-    if (m_result && m_result->ok() && !m_result_stale)
+    if (m_result && m_result->ok() && !m_result_stale) {
+        ColorRGBA color = CriticalColor;
+        if (failed()) {
+            color.a(float(0.35 + 0.65 * (0.5 + 0.5 * std::sin(2. * PI * FLASH_HZ * t))));
+            m_parent.request_extra_frame();
+        }
         render_model(m_marker, Geometry::translation_transform(m_result->critical_point) * Geometry::scale_transform(0.04 * m_arrow_length / 0.35),
-                     CriticalColor);
+                     color);
+    }
 
     glsafe(::glDisable(GL_BLEND));
+}
+
+// Printed layers of the sliced object, in world coordinates, when slicing is
+// complete and current: these carry modifiers, variable layer height and Orca's own
+// solid infill decisions. Null when the object has not been sliced since its last change.
+std::optional<SA::PrintedLayers> GLGizmoStrength::sliced_layers(double z_min) const
+{
+    Plater *plater = wxGetApp().plater();
+    if (plater->is_background_process_slicing())
+        return std::nullopt;
+    const ModelObject   *mo = m_c->selection_info()->model_object();
+    const ModelInstance *mi = mo->instances[m_parent.get_selection().get_instance_idx()];
+    for (const PrintObject *po : plater->fff_print().objects()) {
+        if (po->model_object()->id() != mo->id() || !po->is_step_done(posPrepareInfill) || po->layers().empty())
+            continue;
+        const auto inst = std::find_if(po->instances().begin(), po->instances().end(),
+                                       [mi](const PrintInstance &pi) { return pi.model_instance->id() == mi->id(); });
+        if (inst == po->instances().end())
+            return std::nullopt;
+        return SA::layers_from_print_object(*po, *inst, z_min);
+    }
+    return std::nullopt;
 }
 
 void GLGizmoStrength::run_analysis()
@@ -309,52 +419,122 @@ void GLGizmoStrength::run_analysis()
         }
         ++idx;
     }
-    lc.force = force();
+    // Analysed at 1 N: results scale to any load without running again.
+    lc.force = m_direction;
 
-    // The analysis follows the settings the object will actually be printed with.
     DynamicPrintConfig cfg = wxGetApp().preset_bundle->full_config();
     cfg.apply(mo->config.get(), true);
-    SA::PrintSettings print;
-    const double      nozzle = cfg.opt_float("nozzle_diameter", 0);
-    print.layer_height       = cfg.opt_float("layer_height");
-    print.wall_loops         = cfg.opt_int("wall_loops");
-    print.infill             = cfg.option<ConfigOptionPercent>("sparse_infill_density")->value / 100.;
-    print.wall_width         = cfg.get_abs_value("inner_wall_line_width", nozzle);
-    if (print.wall_width <= 0.)
-        print.wall_width = 1.125 * nozzle;
-
-    const auto  *types    = cfg.option<ConfigOptionStrings>("filament_type");
-    const int    extruder = cfg.has("extruder") ? std::max(1, cfg.opt_int("extruder")) : 1;
-    const std::string type = types && !types->values.empty() ? types->values[std::min<size_t>(extruder - 1, types->values.size() - 1)] : "";
+    const auto       *types    = cfg.option<ConfigOptionStrings>("filament_type");
+    const int         extruder = cfg.has("extruder") ? std::max(1, cfg.opt_int("extruder")) : 1;
+    const std::string type     = types && !types->values.empty() ? types->values[std::min<size_t>(extruder - 1, types->values.size() - 1)] : "";
     const SA::Material *material = SA::find_material(type);
     m_material_note = material ? material->name :
                                  (boost::format(_u8L("%1% (unknown filament type %2%)")) % SA::default_material().name % type).str();
 
-    m_print_note = (boost::format(_u8L("%1% walls, %2% infill, %3% mm layers")) % print.wall_loops %
-                    (std::to_string(int(std::round(print.infill * 100.))) + "%") % print.layer_height).str();
+    std::optional<SA::PrintedLayers> layers = sliced_layers(Slic3r::bounding_box(mesh).min.z());
+    m_from_slices                           = layers.has_value();
+    if (m_from_slices) {
+        m_print_note = _u8L("From the sliced layers, with modifiers and solid infill");
+    } else {
+        // Laid out from the object's settings as Orca would print it.
+        SA::PrintSettings print;
+        const double      nozzle = cfg.opt_float("nozzle_diameter", 0);
+        print.layer_height       = cfg.opt_float("layer_height");
+        print.wall_loops         = cfg.opt_int("wall_loops");
+        print.infill             = cfg.option<ConfigOptionPercent>("sparse_infill_density")->value / 100.;
+        print.wall_width         = cfg.get_abs_value("inner_wall_line_width", nozzle);
+        if (print.wall_width <= 0.)
+            print.wall_width = 1.125 * nozzle;
+        auto shell_layers = [&](const char *layers_key, const char *thickness_key) {
+            return std::max(cfg.opt_int(layers_key), int(std::ceil(cfg.opt_float(thickness_key) / print.layer_height - 1e-6)));
+        };
+        print.top_layers    = shell_layers("top_shell_layers", "top_shell_thickness");
+        print.bottom_layers = shell_layers("bottom_shell_layers", "bottom_shell_thickness");
+        layers              = SA::layers_from_mesh(mesh, print);
+        m_print_note = (boost::format(_u8L("%1% walls, %2% top and %3% bottom layers, %4% infill, %5% mm layers")) % print.wall_loops %
+                        print.top_layers % print.bottom_layers % (std::to_string(int(std::round(print.infill * 100.))) + "%") %
+                        print.layer_height).str();
+    }
 
-    m_result       = SA::analyse(mesh, lc, material ? *material : SA::default_material(), print);
+    m_base_result = SA::analyse(*layers, lc, material ? *material : SA::default_material());
+    m_result_mesh = std::move(mesh);
+    m_vertex_utilization.clear();
+    m_vertex_displacement.clear();
+    if (m_base_result->ok())
+        for (const stl_vertex &v : m_result_mesh.vertices) {
+            m_vertex_utilization.push_back(SA::utilization_at(*m_base_result, v.cast<double>()));
+            m_vertex_displacement.push_back(SA::displacement_at(*m_base_result, v.cast<double>()));
+        }
     m_result_stale = false;
+    update_result();
+}
+
+void GLGizmoStrength::update_result()
+{
+    m_mesh_phase = -1.;
+    m_result     = m_base_result;
+    if (!m_result || !m_result->ok())
+        return;
+    if (m_load_mode == LoadMode::MaxLoad) {
+        if (m_result->safety_factor <= 0.) {
+            m_result->error = _u8L("This part has no closed wall around the cut to resist the twist, so it takes no load like this.");
+            return;
+        }
+        m_result_load = m_result->safety_factor / std::max(1.f, m_target_fos);
+    } else {
+        m_result_load = m_magnitude * unit_to_newton();
+        if (m_result_load <= 0.) {
+            m_result->error = _u8L("Enter a load greater than zero.");
+            return;
+        }
+    }
+    SA::scale_load(*m_result, m_result_load);
     m_parent.set_as_dirty();
 }
 
-void GLGizmoStrength::render_direction_input()
+void GLGizmoStrength::render_load_input()
 {
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_L("Load"));
     ImGui::SameLine(m_imgui->scaled(4.f));
-    ImGui::PushItemWidth(m_imgui->scaled(4.f));
-    if (ImGui::BBLDragFloat("##magnitude", &m_magnitude, 0.1f, 0.f, 10000.f, "%.2f")) {
-        m_magnitude = std::max(0.f, m_magnitude);
-        invalidate_result();
+    if (m_imgui->radio_button(_L("Maximum load"), m_load_mode == LoadMode::MaxLoad)) {
+        m_load_mode = LoadMode::MaxLoad;
+        update_result();
+    }
+    ImGui::SameLine();
+    if (m_imgui->radio_button(_L("Check a load"), m_load_mode == LoadMode::CheckLoad)) {
+        m_load_mode = LoadMode::CheckLoad;
+        update_result();
+    }
+
+    ImGui::AlignTextToFramePadding();
+    if (m_load_mode == LoadMode::MaxLoad) {
+        m_imgui->text(_L("Safety factor"));
+        ImGui::SameLine(m_imgui->scaled(4.f));
+        ImGui::PushItemWidth(m_imgui->scaled(4.f));
+        if (ImGui::BBLDragFloat("##target_fos", &m_target_fos, 0.05f, 1.f, 10.f, "%.2f")) {
+            m_target_fos = std::clamp(m_target_fos, 1.f, 10.f);
+            update_result();
+        }
+    } else {
+        m_imgui->text(_L("Load"));
+        ImGui::SameLine(m_imgui->scaled(4.f));
+        ImGui::PushItemWidth(m_imgui->scaled(4.f));
+        if (ImGui::BBLDragFloat("##magnitude", &m_magnitude, 0.1f, 0.f, 10000.f, "%.2f")) {
+            m_magnitude = std::max(0.f, m_magnitude);
+            update_result();
+        }
     }
     ImGui::SameLine();
     int unit = int(m_unit);
     if (m_imgui->combo(std::string("##unit"), {_u8L("kg"), _u8L("lb"), _u8L("N")}, unit, 0, 0.f, m_imgui->scaled(3.f))) {
         m_unit = Unit(unit);
-        invalidate_result();
+        update_result();
     }
+}
 
+void GLGizmoStrength::render_direction_input()
+{
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_L("Direction"));
     static const std::array<std::pair<const char *, Vec3d>, 6> presets{{{"-Z", -Vec3d::UnitZ()},
@@ -398,15 +578,32 @@ void GLGizmoStrength::render_result()
     if (m_result_stale)
         m_imgui->text_colored(ImGuiWrapper::COL_RED, _L("Results are out of date. Analyze again."));
 
-    const ImVec4 color = r.safety_factor < 1. ? ImGuiWrapper::COL_RED :
-                         r.safety_factor < 2. ? ImGuiWrapper::COL_ORANGE_LIGHT :
-                                                ImGuiWrapper::COL_ORCA;
-    const wxString verdict = r.safety_factor < 1. ? _L("Likely to break") :
-                             r.safety_factor < 2. ? _L("Little margin") :
-                                                    _L("Should hold");
-    m_imgui->text_colored(color, (boost::format(_u8L("Safety factor %1$.2f")) % r.safety_factor).str() + "  " + verdict.ToUTF8().data());
+    if (m_load_mode == LoadMode::MaxLoad) {
+        m_imgui->text_colored(ImGuiWrapper::COL_ORCA, (boost::format(_u8L("Maximum load %1%")) % format_load(m_result_load)).str());
+        m_imgui->text((boost::format(_u8L("at safety factor %1$.2f")) % r.safety_factor).str());
+    } else {
+        const std::string fos = (boost::format(_u8L("Safety factor %1$.2f")) % r.safety_factor).str();
+        if (failed()) {
+            // Flash the verdict so a failing part cannot be missed.
+            const double t     = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start_time).count();
+            const float  pulse = float(0.5 + 0.5 * std::sin(2. * PI * FLASH_HZ * t));
+            const std::string text = fos + "  " + _u8L("Will break");
+            const ImVec2 pos  = ImGui::GetCursorScreenPos();
+            const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+            const float  pad  = m_imgui->scaled(0.2f);
+            ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(pos.x - pad, pos.y - pad), ImVec2(pos.x + size.x + pad, pos.y + size.y + pad),
+                                                      ImGui::GetColorU32(ImVec4(0.85f, 0.1f, 0.1f, 0.35f + 0.65f * pulse)), 3.f);
+            m_imgui->text_colored(ImVec4(1.f, 1.f, 1.f, 1.f), text);
+            m_parent.request_extra_frame();
+        } else {
+            const bool low = r.safety_factor < m_target_fos;
+            m_imgui->text_colored(low ? ImGuiWrapper::COL_ORANGE_LIGHT : ImGuiWrapper::COL_ORCA,
+                                  fos + "  " + (low ? _u8L("Little margin") : _u8L("Should hold")));
+        }
+        m_imgui->text((boost::format(_u8L("Load %1%")) % format_load(m_result_load)).str());
+    }
 
-    const char *axes[3]  = {"X", "Y", "Z"};
+    const char       *axes[3]  = {"X", "Y", "Z"};
     const std::string modes[4] = {_u8L("bending"), _u8L("tension"), _u8L("shear"), _u8L("torsion")};
     m_imgui->text((boost::format(_u8L("Peak stress %1$.1f MPa of %2$.1f MPa allowed")) % r.stress % r.allowable).str());
     m_imgui->text((boost::format(_u8L("Weakest cut: %1% = %2$.1f mm, mostly %3%")) % axes[r.axis] % r.critical_point[r.axis] %
@@ -416,7 +613,26 @@ void GLGizmoStrength::render_result()
     if (r.kt > 1.01)
         m_imgui->text((boost::format(_u8L("Stress raised %1$.1fx by a hole")) % r.kt).str());
     m_imgui->text((boost::format(_u8L("Deflection at load %1$.2f mm")) % r.deflection).str());
-    m_imgui->text_colored(ImGuiWrapper::COL_GREY_LIGHT, m_material_note + ", " + m_print_note);
+
+    ImGui::Separator();
+    if (m_imgui->bbl_checkbox(_L("Stress colors"), m_show_stress))
+        m_mesh_phase = -1.;
+    ImGui::SameLine();
+    if (m_imgui->bbl_checkbox(_L("Deflected shape"), m_show_deflection))
+        m_mesh_phase = -1.;
+    if (m_show_deflection) {
+        if (m_imgui->bbl_checkbox(_L("Animate"), m_animate))
+            m_mesh_phase = -1.;
+        ImGui::SameLine();
+        if (m_imgui->bbl_checkbox(_L("Exaggerate"), m_exaggerate))
+            m_mesh_phase = -1.;
+    }
+    if (m_show_stress)
+        m_imgui->text_colored(ImGuiWrapper::COL_GREY_LIGHT, _L("Blue: little stress. Red: at the breaking point."));
+
+    m_imgui->text_colored(ImGuiWrapper::COL_GREY_LIGHT, m_material_note + ". " + m_print_note + ".");
+    if (!m_from_slices)
+        m_imgui->text_colored(ImGuiWrapper::COL_GREY_LIGHT, _L("Slice the plate to include modifiers and per-part settings."));
     m_imgui->text_colored(ImGuiWrapper::COL_GREY_LIGHT, _L("Estimate from beam theory, not FEA."));
 }
 
@@ -425,7 +641,7 @@ void GLGizmoStrength::on_render_input_window(float x, float y, float bottom_limi
     if (!m_c->selection_info()->model_object())
         return;
 
-    const float approx_height = m_imgui->scaled(16.f);
+    const float approx_height = m_imgui->scaled(20.f);
     y                         = std::min(y, bottom_limit - approx_height);
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
 
@@ -455,6 +671,7 @@ void GLGizmoStrength::on_render_input_window(float x, float y, float bottom_limi
     }
 
     ImGui::Separator();
+    render_load_input();
     render_direction_input();
     ImGui::Separator();
 
