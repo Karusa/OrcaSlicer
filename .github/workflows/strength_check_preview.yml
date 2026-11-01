@@ -1,0 +1,111 @@
+# Builds the Strength check preview for testers on this fork and attaches the
+# macOS and Windows packages to a GitHub release. Not part of the upstream
+# change: the patch offered to OrcaSlicer is generated without this file.
+#
+# Run it by pushing a tag such as strength-check-preview-1, or from the
+# Actions tab (Run workflow) with a tag name. Builds are unsigned.
+name: Strength check preview
+
+on:
+  push:
+    tags:
+      - 'strength-check-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create or update'
+        required: true
+        default: 'strength-check-preview'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_windows:
+    name: Build Windows x64
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: windows-latest
+      arch: x64
+      compiler: clang
+    secrets: inherit
+
+  build_macos_arch:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    uses: ./.github/workflows/build_check_cache.yml
+    with:
+      os: macos-14
+      arch: ${{ matrix.arch }}
+    secrets: inherit
+
+  build_macos_universal:
+    name: Build macOS Universal
+    needs: build_macos_arch
+    uses: ./.github/workflows/build_orca.yml
+    with:
+      os: macos-14
+      arch: universal
+      macos-combine-only: true
+    secrets: inherit
+
+  publish:
+    name: Publish preview release
+    needs: [build_windows, build_macos_universal]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          pattern: OrcaSlicer_Windows_*_x64
+          path: dist/win-installer
+          merge-multiple: true
+      - name: Download Windows portable build
+        uses: actions/download-artifact@v8
+        with:
+          pattern: OrcaSlicer_Windows_*_x64_portable
+          path: dist/win-portable/OrcaSlicer
+          merge-multiple: true
+      - name: Download macOS DMG
+        uses: actions/download-artifact@v8
+        with:
+          pattern: OrcaSlicer_Mac_universal_*
+          path: dist/mac
+          merge-multiple: true
+      # Stable asset names, so a link in a post keeps working across rebuilds
+      # (releases/latest/download/<name>).
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          cp dist/win-installer/*.exe release/OrcaSlicer-StrengthCheck_Windows_x64_Setup.exe
+          (cd dist/win-portable && zip -qr ../../release/OrcaSlicer-StrengthCheck_Windows_x64_portable.zip OrcaSlicer)
+          cp dist/mac/OrcaSlicer_Mac_universal_*.dmg release/OrcaSlicer-StrengthCheck_Mac_universal.dmg
+          ls -l release
+      - name: Create or update the release
+        run: |
+          notes=$(cat <<'NOTES'
+          Preview build of OrcaSlicer with the **Strength check** tool, built from `${{ github.sha }}`.
+
+          - **Windows**: run the Setup .exe, or unzip the portable build. SmartScreen may warn that the app is unrecognised: More info, then Run anyway.
+          - **macOS** (Apple silicon and Intel): open the .dmg and drag OrcaSlicer to Applications. The build is not notarized, so the first time right-click the app and choose Open, or run `xattr -dr com.apple.quarantine /Applications/OrcaSlicer.app`.
+
+          This installs as OrcaSlicer and shares its settings with a regular OrcaSlicer install. Back up your profiles first if you rely on them.
+
+          About the tool and how to use it: https://github.com/Karusa/orca-strength-check
+          NOTES
+          )
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --notes "$notes" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --latest \
+              --title "Strength check preview" --notes "$notes" -R "$GITHUB_REPOSITORY"
+          fi
